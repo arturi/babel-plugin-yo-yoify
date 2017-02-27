@@ -5,6 +5,10 @@ const hyperx = require('hyperx')
 const issvg = require('@f/is-svg')
 const svgNamespace = require('@f/svg-namespace')
 
+/**
+ * Try to return a nice variable name for an element based on its HTML id,
+ * classname, or tagname.
+ */
 function getElementName (props, tag) {
   if (typeof props.id === 'string' && !placeholderRe.test(props.id)) {
     return camelCase(props.id)
@@ -15,36 +19,60 @@ function getElementName (props, tag) {
   return tag || 'bel'
 }
 
+/**
+ * Regex for detecting placeholders.
+ */
 const placeholderRe = /\0(\d+)\0/g
 
+/**
+ * Get a placeholder string for a numeric ID.
+ */
 const getPlaceholder = (i) => `\0${i}\0`
 
 module.exports = (babel) => {
   const t = babel.types
   const belModuleNames = ['bel', 'yo-yo', 'choo', 'choo/html']
 
+  // Unique ID for `on-load` calls, so it can recognise elements.
+  let onloadIndex = 1
+
+  /**
+   * Returns a node that creates a namespaced HTML element.
+   */
   const createNsElement = (ns, tag) =>
     t.callExpression(
       t.memberExpression(t.identifier('document'), t.identifier('createElementNS')),
       [ns, t.stringLiteral(tag)]
     )
 
+  /**
+   * Returns a node that creates an element.
+  */
   const createElement = (tag) =>
     t.callExpression(
       t.memberExpression(t.identifier('document'), t.identifier('createElement')),
       [t.stringLiteral(tag)]
     )
 
+  /**
+   * Returns a node that sets a DOM property.
+   */
   const setDomProperty = (id, prop, value) =>
     t.assignmentExpression('=',
       t.memberExpression(id, t.identifier(prop)),
       value)
 
+  /**
+   * Returns a node that sets a DOM attribute.
+   */
   const setDomAttribute = (id, attr, value) =>
     t.callExpression(
       t.memberExpression(id, t.identifier('setAttribute')),
       [t.stringLiteral(attr), value])
 
+  /**
+   * Returns a node that appends children to an element.
+   */
   const appendChild = (appendChildId, id, children) =>
     t.callExpression(
       appendChildId,
@@ -52,6 +80,11 @@ module.exports = (babel) => {
     )
 
   const addedRequires = Symbol('added requires')
+  /**
+   * Add a require call to a file, returning the variable name it's bound to.
+   * Can safely be called with the same module name multiple times in a single
+   * file.
+   */
   const addRequire = (file, module, name) => {
     if (!file[addedRequires]) {
       file[addedRequires] = {}
@@ -68,6 +101,10 @@ module.exports = (babel) => {
   }
 
   const addedVariables = Symbol('added variables')
+  /**
+   * Like addRequire, but adds a variable with a constant value instead of a
+   * require() call.
+   */
   const addVariable = (file, name, value) => {
     if (!file[addedVariables]) {
       file[addedVariables] = {}
@@ -80,6 +117,9 @@ module.exports = (babel) => {
     return file[addedVariables][name]
   }
 
+  /**
+   * Wrap a node in a String() call if it may not be a string.
+   */
   const ensureString = (node) => {
     if (t.isStringLiteral(node)) {
       return node
@@ -87,9 +127,16 @@ module.exports = (babel) => {
     return t.callExpression(t.identifier('String'), [node])
   }
 
+  /**
+   * Concatenate multiple parts of an HTML attribute.
+   */
   const concatAttribute = (left, right) =>
     t.binaryExpression('+', left, right)
 
+  /**
+   * Check if a node is *not* the empty string.
+   * (Inverted so it can be used with `[].map` easily)
+   */
   const isNotEmptyString = (node) =>
     !t.isStringLiteral(node, { value: '' })
 
@@ -106,6 +153,10 @@ module.exports = (babel) => {
 
     const root = hyperx(transform).apply(null, [quasis].concat(expressionPlaceholders))
 
+    /**
+     * Convert placeholders used in the template string back to the AST nodes
+     * they reference.
+     */
     function convertPlaceholders (value) {
       // Probably AST nodes.
       if (typeof value !== 'string') {
@@ -120,12 +171,16 @@ module.exports = (babel) => {
       })
     }
 
+    /**
+     * Transform a hyperx vdom element to an AST node that creates the element.
+     */
     function transform (tag, props, children) {
       const id = path.scope.generateUidIdentifier(getElementName(props, tag))
       path.scope.push({ id })
 
       const result = []
 
+      // Use the SVG namespace for svg elements.
       if (issvg(tag)) {
         const svgBinding = addVariable(state.file, 'svgNamespace', t.stringLiteral(svgNamespace))
         result.push(t.assignmentExpression('=', id, createNsElement(svgBinding, tag)))
@@ -145,7 +200,8 @@ module.exports = (babel) => {
             onload && onload.length === 1
               ? onload[0] : t.nullLiteral(),
             onunload && onunload.length === 1
-              ? onunload[0] : t.nullLiteral()
+              ? onunload[0] : t.nullLiteral(),
+            t.numericLiteral(onloadIndex++)
           ]
         ))
       }
@@ -163,6 +219,7 @@ module.exports = (babel) => {
           return
         }
 
+        // abc.onclick = xyz
         if (attrName.slice(0, 2) === 'on') {
           const value = convertPlaceholders(props[propName]).filter(isNotEmptyString)
           result.push(setDomProperty(id, attrName,
@@ -174,6 +231,7 @@ module.exports = (babel) => {
           return
         }
 
+        // abc.setAttribute('class', xyz)
         result.push(setDomAttribute(id, attrName,
           convertPlaceholders(props[propName])
             .map(ensureString)
@@ -207,13 +265,14 @@ module.exports = (babel) => {
   }
 
   return {
-    visitor: {
-      Program: {
-        enter (path, state) {
-          state.file.yoyoVariables = []
-        }
-      },
+    pre() {
+      this.yoyoBindings = new Set()
+    },
+    post() {
+      this.yoyoBindings.clear()
+    },
 
+    visitor: {
       /**
        * Collect bel variable names and remove their imports if necessary.
        */
@@ -222,7 +281,7 @@ module.exports = (babel) => {
         if (belModuleNames.indexOf(importFrom) !== -1) {
           const specifier = path.get('specifiers')[0]
           if (specifier.isImportDefaultSpecifier()) {
-            state.file.yoyoVariables.push(specifier.get('local').node.name)
+            this.yoyoBindings.add(path.scope.getBinding(specifier.node.local.name))
           }
 
           if (importFrom === 'bel') {
@@ -241,7 +300,7 @@ module.exports = (babel) => {
 
           const importFrom = firstArg.value
           if (belModuleNames.indexOf(importFrom) !== -1) {
-            state.file.yoyoVariables.push(path.parentPath.node.id.name)
+            this.yoyoBindings.add(path.parentPath.scope.getBinding(path.parentPath.node.id.name))
           }
 
           if (importFrom === 'bel') {
@@ -251,12 +310,14 @@ module.exports = (babel) => {
       },
 
       TaggedTemplateExpression (path, state) {
-        state.file.yoyoVariables.forEach((name) => {
-          if (path.get('tag').isIdentifier({ name })) {
+        const tag = path.get('tag')
+        if (tag.isIdentifier()) {
+          const binding = path.scope.getBinding(tag.node.name)
+          if (this.yoyoBindings.has(binding)) {
             const newPath = yoyoify(path.get('quasi'), state)
             path.replaceWith(newPath)
           }
-        })
+        }
       }
     }
   }
